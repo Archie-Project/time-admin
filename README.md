@@ -5,10 +5,22 @@ Made with XFCE in mind.
 ## Installation
 For now there's only a `deb` package available, but you can always address to [releases](https://github.com/Archie-Project/time-admin/releases).
 
+### Arch Linux
+Install the tool via AUR
+```bash
+$ git clone https://aur.archlinux.org/time-admin-git.git
+$ cd time-admin-git
+$ makepkg -si
+```
+or
+```bash
+$ yay -S time-admin-git
+```
+
 ### Debian/Ubuntu
 Download the `deb` package and run
 ```bash
-# dpkg -i time-admin_x.y.z.deb
+$ sudo dpkg -i time-admin_x.y.z.deb
 ```
 
 ### Any Linux
