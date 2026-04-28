@@ -22,3 +22,6 @@ Just clone the repository and make sure you meet the dependencies. Then run `ins
 - gir1.2-polkit-1.0
 - python3-pydbus
 
+### Warning ⚠️
+Conflicts: gnome-system-tools
+
