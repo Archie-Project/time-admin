@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+Time Admin - Date, time and NTP configuration tool for Linux desktops.
+"""
+
+import datetime
+import math
+import gi
+from pydbus import SystemBus, SessionBus
+from zoneinfo import ZoneInfo
+
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Gdk, Gio
+
+Gtk.Window.set_default_icon_name("preferences-system-time")
+
+
+class AnalogClock(Gtk.DrawingArea):
+    """Analog clock widget."""
+
+    def __init__(self):
+        super().__init__()
+        self.set_size_request(200, 200)
+        self.connect("draw", self._on_draw)
+        self._timeout_id = GLib.timeout_add_seconds(1, self._on_timeout)
+
+    def _on_timeout(self):
+        self.queue_draw()
+        return True
+
+    def _on_draw(self, widget, cr):
+        width = self.get_allocated_width()
+        height = self.get_allocated_height()
+        if width <= 0 or height <= 0:
+            return True
+
+        center_x = width / 2.0
+        center_y = height / 2.0
+        radius = min(center_x, center_y) * 0.9
+
+        now = datetime.datetime.now()
+        hour = now.hour % 12
+        minute = now.minute
+        second = now.second + now.microsecond / 1_000_000.0
+
+        cr.save()
+        # Clock face
+        cr.arc(center_x, center_y, radius, 0, 2 * math.pi)
+        cr.set_source_rgb(1, 1, 1)
+        cr.fill_preserve()
+        cr.set_source_rgb(0, 0, 0)
+        cr.set_line_width(2)
+        cr.stroke()
+
+        # Hour marks
+        for i in range(1, 13):
+            angle = math.radians(90 - i * 30)
+            inner = radius * (0.75 if i % 3 == 0 else 0.8)
+            outer = radius
+            x1 = center_x + inner * math.cos(angle)
+            y1 = center_y - inner * math.sin(angle)
+            x2 = center_x + outer * math.cos(angle)
+            y2 = center_y - outer * math.sin(angle)
+            cr.move_to(x1, y1)
+            cr.line_to(x2, y2)
+            cr.set_line_width(3 if i % 3 == 0 else 1.5)
+            cr.stroke()
+
+        # Second hand
+        sec_angle = math.radians(90 - second * 6)
+        sec_len = radius * 0.85
+        cr.move_to(center_x, center_y)
+        cr.line_to(center_x + sec_len * math.cos(sec_angle),
+                   center_y - sec_len * math.sin(sec_angle))
+        cr.set_source_rgb(1, 0, 0)
+        cr.set_line_width(1.5)
+        cr.stroke()
+
+        # Minute hand
+        min_angle = math.radians(90 - (minute + second / 60.0) * 6)
+        min_len = radius * 0.7
+        cr.move_to(center_x, center_y)
+        cr.line_to(center_x + min_len * math.cos(min_angle),
+                   center_y - min_len * math.sin(min_angle))
+        cr.set_source_rgb(0, 0, 0)
+        cr.set_line_width(3)
+        cr.stroke()
+
+        # Hour hand
+        hour_angle = math.radians(90 - (hour + minute / 60.0) * 30)
+        hour_len = radius * 0.5
+        cr.move_to(center_x, center_y)
+        cr.line_to(center_x + hour_len * math.cos(hour_angle),
+                   center_y - hour_len * math.sin(hour_angle))
+        cr.set_line_width(5)
+        cr.stroke()
+
+        # Center pin
+        cr.arc(center_x, center_y, radius * 0.05, 0, 2 * math.pi)
+        cr.set_source_rgb(0, 0, 0)
+        cr.fill()
+        cr.restore()
+        return True
+
+    def stop_updates(self):
+        if self._timeout_id:
+            GLib.source_remove(self._timeout_id)
+            self._timeout_id = None
+
+
+class TimeConfig(Gtk.ApplicationWindow):
+    """Main window – calendar, clock, timezone, NTP and time controls."""
+
+    def __init__(self, application=None):
+        super().__init__(title="Time Admin", application=application)
+        self.set_border_width(12)
+        self.set_resizable(False)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        self.timedate = SystemBus().get('org.freedesktop.timedate1')
+        self._setup_ui()
+        self._update_status_timezone()
+        self.show_all()
+
+        self._last_timezone = self.timedate.Timezone
+        self._last_datetime = self._get_current_datetime_from_controls()
+
+    def _setup_ui(self):
+        """Build the user interface."""
+        main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.add(main_box)
+
+        # Clock box (will be placed inside grid)
+        self.clock_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        self.clock = AnalogClock()
+        self.clock.set_size_request(130, 130)
+        self.clock.set_halign(Gtk.Align.CENTER)
+        self.clock_box.pack_start(self.clock, True, True, 0)
+
+        # Configuration panel
+        config_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        main_box.pack_start(config_box, True, True, 0)
+
+        # Timezone selector
+        tz_box = Gtk.Box(spacing=6)
+        tz_box.pack_start(Gtk.Label(label="Time zone:"), False, False, 0)
+        self.combo_timezone = Gtk.ComboBoxText()
+        self._load_timezones()
+        tz_box.pack_start(self.combo_timezone, True, True, 0)
+        config_box.pack_start(tz_box, False, False, 4)
+
+        # NTP switch
+        ntp_box = Gtk.Box(spacing=6)
+        ntp_box.pack_start(Gtk.Label(label="NTP (auto sync):"), False, False, 0)
+        self.ntp_switch = Gtk.Switch()
+        self.ntp_switch.connect("notify::active", self._on_ntp_switch_toggled)
+        ntp_box.pack_start(self.ntp_switch, False, False, 0)
+        config_box.pack_start(ntp_box, False, False, 4)
+
+        # Status label
+        self.status_label = Gtk.Label()
+        config_box.pack_start(self.status_label, False, False, 0)
+
+        # Date & time frame
+        dt_frame = Gtk.Frame(label="Date and time")
+        config_box.pack_start(dt_frame, False, False, 0)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(5)
+        grid.set_column_spacing(10)
+        grid.set_margin_top(5)
+        grid.set_margin_bottom(5)
+        grid.set_margin_start(5)
+        grid.set_margin_end(5)
+        dt_frame.add(grid)
+
+        # Calendar
+        self.calendar = Gtk.Calendar()
+        self.calendar.set_hexpand(True)
+        grid.attach(self.calendar, 0, 0, 2, 1)
+
+        # Clock next to calendar
+        grid.attach(self.clock_box, 2, 0, 2, 1)
+
+        # Time spin buttons
+        spin_box = Gtk.Box(spacing=6)
+        self.hour_spin = Gtk.SpinButton.new_with_range(-1, 24, 1)
+        self.minute_spin = Gtk.SpinButton.new_with_range(-1, 60, 1)
+        self.second_spin = Gtk.SpinButton.new_with_range(-1, 60, 1)
+
+        self.hour_spin.connect("value-changed", self._on_hour_changed)
+        self.minute_spin.connect("value-changed", self._on_minute_changed)
+        self.second_spin.connect("value-changed", self._on_second_changed)
+
+        spin_box.pack_start(Gtk.Label(label="Hour:"), False, False, 0)
+        spin_box.pack_start(self.hour_spin, True, True, 0)
+        spin_box.pack_start(Gtk.Label(label="Min:"), False, False, 0)
+        spin_box.pack_start(self.minute_spin, True, True, 0)
+        spin_box.pack_start(Gtk.Label(label="Sec:"), False, False, 0)
+        spin_box.pack_start(self.second_spin, True, True, 0)
+        grid.attach(spin_box, 0, 1, 2, 1)
+
+        # Current system time label
+        self.current_time_label = Gtk.Label()
+        grid.attach(self.current_time_label, 0, 2, 3, 1)
+
+        # Buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        btn_apply = Gtk.Button(label="Apply")
+        btn_cancel = Gtk.Button(label="Close")
+        btn_apply.connect("clicked", self._apply_changes)
+        btn_cancel.connect("clicked", lambda x: self.destroy())
+        btn_box.pack_end(btn_apply, False, False, 0)
+        btn_box.pack_end(btn_cancel, False, False, 0)
+        config_box.pack_end(btn_box, False, False, 0)
+
+    # ------------------------------------------------------------------
+    # NTP switch handler (manual toggle)
+    # ------------------------------------------------------------------
+    def _on_ntp_switch_toggled(self, switch, _):
+        active = switch.get_active()
+        try:
+            self.timedate.SetNTP(active, True)
+            self._notify("NTP", f"Auto sync {'enabled' if active else 'disabled'}.")
+        except Exception as e:
+            self._notify("NTP", f"Error: {e}")
+            switch.set_state(not active)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _get_current_datetime_from_controls(self):
+        year, month, day = self.calendar.get_date()
+        month += 1
+        hour = int(self.hour_spin.get_value())
+        minute = int(self.minute_spin.get_value())
+        second = int(self.second_spin.get_value())
+        return datetime.datetime(year, month, day, hour, minute, second)
+
+    def _load_timezones(self):
+        try:
+            zones = self.timedate.ListTimezones()
+            for z in zones:
+                self.combo_timezone.append_text(z)
+        except Exception as e:
+            print(f"Error loading timezones: {e}")
+
+    def _update_status_timezone(self):
+        try:
+            cur = self.timedate.Timezone
+            self.status_label.set_markup(f"<small>Current zone: {cur}</small>")
+            ntp_active = self.timedate.NTP
+            self.ntp_switch.set_active(ntp_active)
+            self._update_datetime_spins()
+        except Exception as e:
+            self.status_label.set_text(f"Error: {e}")
+
+    def _update_datetime_spins(self):
+        now = datetime.datetime.now().replace(microsecond=0)
+        self.calendar.select_month(now.month - 1, now.year)
+        self.calendar.select_day(now.day)
+        self.hour_spin.set_value(now.hour)
+        self.minute_spin.set_value(now.minute)
+        self.second_spin.set_value(now.second)
+        self.current_time_label.set_markup(
+            f"<small>Current system time: {now.strftime('%Y-%m-%d %H:%M:%S')}</small>"
+        )
+
+    # ------------------------------------------------------------------
+    # Spin button validators (wrap‑around)
+    # ------------------------------------------------------------------
+    def _on_hour_changed(self, _):
+        v = self.hour_spin.get_value_as_int()
+        if v > 23:
+            self.hour_spin.set_value(0)
+        elif v < 0:
+            self.hour_spin.set_value(23)
+
+    def _on_minute_changed(self, _):
+        v = self.minute_spin.get_value_as_int()
+        if v > 59:
+            self.minute_spin.set_value(0)
+        elif v < 0:
+            self.minute_spin.set_value(59)
+
+    def _on_second_changed(self, _):
+        v = self.second_spin.get_value_as_int()
+        if v > 59:
+            self.second_spin.set_value(0)
+        elif v < 0:
+            self.second_spin.set_value(59)
+
+    # ------------------------------------------------------------------
+    # Apply all changes (user must disable NTP manually if needed)
+    # ------------------------------------------------------------------
+    def _apply_changes(self, _):
+        selected_tz = self.combo_timezone.get_active_text()
+        selected_dt = self._get_current_datetime_from_controls()
+
+        # Timezone change
+        if selected_tz is not None and selected_tz != self._last_timezone:
+            try:
+                self.timedate.SetTimezone(selected_tz, True)
+                self._last_timezone = selected_tz
+                self._notify("Time zone", f"Changed to {selected_tz}.")
+            except Exception as e:
+                self._notify("Time zone", f"Error: {e}")
+            finally:
+                self.status_label.set_markup(f"<small>Current zone: {self._last_timezone}</small>")
+
+        # Date & time change (no automatic NTP disabling)
+        if selected_dt != self._last_datetime:
+            try:
+                tz = ZoneInfo(self._last_timezone)
+                utc_dt = selected_dt.replace(tzinfo=tz).astimezone(ZoneInfo("UTC"))
+                ts_us = int(utc_dt.timestamp() * 1_000_000)
+                self.timedate.SetTime(ts_us, False, True)
+                self._last_datetime = selected_dt
+                self._notify("Date and time", "System clock updated.")
+            except Exception as e:
+                error_str = str(e)
+                if "AutomaticTimeSyncEnabled" in error_str:
+                    self._notify(
+                        "Cannot change time",
+                        "NTP auto‑sync is enabled. Please disable it using the switch and try again."
+                    )
+                else:
+                    self._notify("Date and time", f"Error: {e}")
+
+    # ------------------------------------------------------------------
+    # Desktop notifications (simplified, no hints)
+    # ------------------------------------------------------------------
+    def _notify(self, summary, body):
+        try:
+            bus = SessionBus()
+            notif = bus.get("org.freedesktop.Notifications")
+            notif.Notify(
+                "Time Admin", 0, "preferences-system-time",
+                summary, body, [], {}, -1
+            )
+        except Exception as e:
+            print(f"Notification failed: {e}")
+
+
+class TimeAdminApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id='io.github.GearFox98.time-admin',
+                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def do_activate(self):
+        win = TimeConfig(application=self)
+        win.present()
+
+
+def main():
+    app = TimeAdminApp()
+    app.run(None)
+
+
+if __name__ == "__main__":
+    main()

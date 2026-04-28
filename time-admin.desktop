@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Time Admin
+Comment=Change system date, time and timezone
+Exec=time-admin
+Icon=preferences-system-time
+Terminal=false
+Categories=Settings;X-XFCE-SettingsDialog;X-XFCE-SystemSettings;
+StartupWMClass=TimeConfig
